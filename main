@@ -2,25 +2,6 @@ import requests
 import json
 from datetime import datetime
 
-def post_with_retry(url, payload, retries=3, delay=2):
-    """
-    リトライ処理を加えたPOSTリクエスト
-    """
-    for attempt in range(retries):
-        try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()  # ステータスコードが200番台でない場合、例外を発生させる
-            return response
-        except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Request failed: {e}")
-            if attempt < retries - 1:
-                print(f"[INFO] Retrying... (Attempt {attempt + 1} of {retries})")
-                time.sleep(delay)
-            else:
-                print("[ERROR] Max retries exceeded. Returning None.")
-                return None
-
-
 def get_api_token():
     """
     APIにログインしてトークンを取得する。
@@ -28,7 +9,7 @@ def get_api_token():
     url = 'https://api.m2msystems.cloud/login'
     mail = "development+20211103@matsuri-tech.com"
     password = "rYGOOh9PgUxFhjhd"
-    
+
 
     payload = {"email": mail, "password": password}
 
@@ -62,7 +43,7 @@ def get_today_cleanings(token: str, target_photo_tour_id: str) -> list:
     """
     Bearer token を用いて、当日の清掃情報を取得。
     さらに photoTourId == target_photo_tour_id のものだけを抽出。
-    
+
     - 日付は固定で "2025-01-28" に設定
     - 戻り値: [{"id":..., "photoTourId":..., ...}, ...]
     """
@@ -135,17 +116,17 @@ def get_commonAreaId(token: str, cleaning_data: dict) -> dict:
     if not operation_id:
         print("[ERROR] Cleaning data does not contain 'id'. Cannot retrieve commonAreaId.")
         return cleaning_data
-    
+
     url = f"https://api-cleaning.m2msystems.cloud/v4/operations/{operation_id}"
-    
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json"
     }
-    
+
     try:
         response = requests.get(url, headers=headers)
-        
+
         if response.status_code == 200:
             print("[INFO] Successfully retrieved operation data.")
             data = response.json()
@@ -161,7 +142,7 @@ def get_commonAreaId(token: str, cleaning_data: dict) -> dict:
             print(f"[ERROR] Failed to retrieve data. Status Code: {response.status_code}")
             print("[DEBUG] Response:", response.text)
             return cleaning_data
-    
+
     except requests.exceptions.RequestException as e:
         print(f"[ERROR] Request failed: {e}")
         return cleaning_data
@@ -274,18 +255,12 @@ URL_STOCKER = "https://us-central1-m2m-core.cloudfunctions.net/Trash_stocker_id_
 # 3) 判定結果が「ゴミ庫」だった場合に呼び出すエンドポイント
 URL_PLACE = "https://us-central1-m2m-core.cloudfunctions.net/Trash_place_id_AI"
 
-def judge_trash(ai_data: dict) -> dict:
+def judge_trash(image_urls: list, placement_id: str, unique_name: str, cleaning_id: str, common_area_id: str) -> list:
     """
-    AI判定を行い、判定結果をai_dataに追加する。
-    ai_data は、すでに commonAreaId と画像URLが追加された状態のデータ。
+    複数の画像URLと個別IDを受け取り、判定を行う。
+    画像URLが空の場合は判定をスキップするが、空の場合にも結果を出力する。
     """
     results = []
-
-    image_urls = ai_data.get("urls", [])
-    placement_id = ai_data.get("placementId")
-    unique_name = ai_data.get("commonAreaName")
-    cleaning_id = ai_data.get("id")
-    common_area_id = ai_data.get("commonAreaId")
 
     for image_url in image_urls:
         if not image_url:  # 画像URLが空の場合
@@ -295,33 +270,34 @@ def judge_trash(ai_data: dict) -> dict:
                 "result": "画像無し",  # 画像がない場合
                 "placement_id": placement_id,
                 "name": unique_name,
-                "cleaning_id": cleaning_id,
-                "commonAreaId": common_area_id
+                "cleaning_id": cleaning_id
             })
             continue  # 次の画像へ
 
         # (A) 1回目: ゴミ庫/ストッカーを判定
         payload = {"urls": [image_url]}
-        response_judge = post_with_retry(URL_JUDGE, payload)
-        if not response_judge:
+        response_judge = requests.post(URL_JUDGE, json=payload)
+        response_judge_data = response_judge.json()
+
+        # 判定結果が空の場合（想定外のレスポンス）
+        results_first = response_judge_data.get("results", [])
+        if not results_first:
             results.append({
                 "url": image_url,
                 "result": "判定不可 (1回目の結果なし)",
                 "placement_id": placement_id,
                 "name": unique_name,
-                "cleaning_id": cleaning_id,
-                "commonAreaId": common_area_id
+                "cleaning_id": cleaning_id
             })
-            continue
-
+            continue  # 次の画像へ
 
         # 1件だけ取り出し
         first_item = results_first[0]
         first_result_label = first_item.get("result", "")  # 例: "ストッカー" or "ゴミ庫"
-        
+
         # 2回目の判定（ストッカー or ゴミ庫）
         final_result = "不明"
-        
+
         if first_result_label == "ストッカー":
             resp = requests.post(URL_STOCKER, json=payload)
             resp_data = resp.json()
@@ -336,7 +312,7 @@ def judge_trash(ai_data: dict) -> dict:
                     final_result = second_label  # 想定外の場合そのまま保持
             else:
                 final_result = "判定不可 (2回目のストッカー結果なし)"
-        
+
         elif first_result_label == "ゴミ庫":
             resp = requests.post(URL_PLACE, json=payload)
             resp_data = resp.json()
@@ -351,72 +327,28 @@ def judge_trash(ai_data: dict) -> dict:
                     final_result = second_label
             else:
                 final_result = "判定不可 (2回目のゴミ庫結果なし)"
-        
+
         else:
             final_result = f"予想外のラベル: {first_result_label}"
 
         # 結果をリストに追加
         results.append({
+            "url": image_url,
             "object": first_result_label,
             "result": final_result,
+            "placement_id": placement_id,
+            "commonAreaId":common_area_id,
+            "name": unique_name,
+            "cleaning_id": cleaning_id
         })
-    
-    # 判定結果を ai_data に追加
-    ai_data["judge_results"] = results
-    return ai_data
 
-
-def enrich_multiple_judge_trash(ai_data_list: list) -> list:
-    """
-    ai_dataのリストに対して全て判定を行い、その結果を返す。
-    """
-    enriched_data = []
-    for ai_data in ai_data_list:
-        enriched_data.append(judge_trash(ai_data))  # 直接 judge_trash を呼び出す
-    return enriched_data
+    return results
 
 
 
 def filter_success_results(results: list) -> list:
     """結果リストから「〇」のみを抽出"""
-    success_list = []
-    
-    for item in results:
-        cleaning_id = item.get("id")
-        name = item.get("commonAreaName")
-        placement_id = item.get("placementId")
-        common_area_id = item.get("commonAreaId", "")
-        cleaning_date = item.get("cleaningDate", "")
-        urls = item.get("urls", [])
-        judge_results = item.get("judge_results", [])
-
-        # 「〇」の判定結果を抽出
-        filtered_judgments = [j for j in judge_results if j.get("result") == "〇"]
-        
-        # どちらも空ならスキップ（意味のあるデータがないため）
-        if not urls and not filtered_judgments:
-            continue  # 空のデータはリストに追加しない
-        
-        # URL と 判定結果の数に応じてデータを作成
-        max_count = max(len(urls), len(filtered_judgments))
-
-        for i in range(max_count):
-            url = urls[i] if i < len(urls) else ""  # URLがない場合は空欄
-            judge = filtered_judgments[i] if i < len(filtered_judgments) else {}
-
-            success_list.append({
-                "id": cleaning_id,
-                "commonAreaName": name,
-                "placementId": placement_id,
-                "commonAreaId": common_area_id,
-                "cleaningDate": cleaning_date,
-                "url": url,
-                "object": judge.get("object", ""),
-                "result": judge.get("result", ""),
-            })
-
-    return success_list
-
+    return [item for item in results if item.get("result") == "〇"]
 
 
 import os
@@ -443,62 +375,25 @@ spreadsheet_id = '1cV_8DH4wLZu7--J9vxIH0rFf7upKa1cKACyDNaONxp0'  # ここに使�
 def write_to_sheet(data, sheet_name="判定一覧"):
     """
     final_resultのデータを指定したGoogle Sheetsのシートに書き込む関数
-    各画像URLごとに判定結果を対応させてスプレッドシートに記録する。
     """
-    # 1行目にヘッダーを設定
-    header = [
-        'Cleaning ID', 'Name', 'Status', 'Result', 
-        'URL', 'Object', 'Common Area ID', 'Cleaning Date'
-    ]
+    range_name = f'{sheet_name}!A2:G'  # 書き込む範囲を指定 (A1からG列)
+
+    # 1行目にヘッダーを設定（新しく"commonAreaId"列も追加）
+    header = ['Cleaning ID', 'Name', 'Placement ID', 'Result', 'URL', 'Object', 'Common Area ID']
     values = [header]
-    
+
     # `data` から値を取り出してリストに追加
     for item in data:
-        cleaning_id = item.get('id')
-        name = item.get('commonAreaName')
-        status = item.get('status')
-        common_area_id = item.get('commonAreaId', '')
-        cleaning_date = item.get('cleaningDate', '')
-        urls = item.get('urls', [])
-        judge_results = item.get('judge_results', [])
-
-        # 画像URLと判定結果を組み合わせて書き込む
-        # もしurlsやjudge_resultsが空の場合でも、空の値を持つ行を出力する
-        if not urls and not judge_results:
-            # 両方が空の場合、1回の行を追加
-            row = [
-                cleaning_id,
-                name,
-                status,
-                '',
-                '',  # 空のURL
-                '',  # 空のオブジェクト
-                common_area_id,
-                cleaning_date
-            ]
-            values.append(row)
-        else:
-            # `urls`と`judge_results`を組み合わせて書き込む
-            for idx in range(max(len(urls), len(judge_results))):
-                url = urls[idx] if idx < len(urls) else ''
-                judge_result = judge_results[idx] if idx < len(judge_results) else {}
-                object_detected = judge_result.get('object', '')
-                result = judge_result.get('result', '')
-
-                row = [
-                    cleaning_id,
-                    name,
-                    status,
-                    result,
-                    url,
-                    object_detected,
-                    common_area_id,
-                    cleaning_date
-                ]
-                values.append(row)
-    
-    # 範囲を動的に設定
-    range_name = f'{sheet_name}!A1:H{len(values)}'  # 最後の行に合わせて範囲を設定
+        row = [
+            item.get('cleaning_id'),   # Cleaning ID
+            item.get('name'),          # Name
+            item.get('placement_id'),  # Placement ID
+            item.get('result'),        # Result (〇 or ×)
+            item.get('url'),           # URL
+            item.get('object', ''),    # Object (判定結果: ストッカー or ゴミ庫)
+            item.get('commonAreaId', '')  # CommonAresID
+        ]
+        values.append(row)
 
     # Sheets APIにデータを書き込む
     request = service.spreadsheets().values().update(
@@ -507,18 +402,20 @@ def write_to_sheet(data, sheet_name="判定一覧"):
     )
     response = request.execute()
 
-     # 「終了」をI5セルに表示
-    update_status_range = "判定一覧!I5"
-    update_status_values = [["終了"]]
-    
-    # 「終了」をI5セルに更新
+    # 「判別終了」をI2セルに表示
+    update_status_range = "判定一覧!I2"
+    update_status_values = [["判別終了"]]
+
     request_status = service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id, range=update_status_range,
         valueInputOption="RAW", body={"values": update_status_values}
     )
     request_status.execute()  # 実行
-    
+
     return response
+
+
+
 
 
 def main(request):
@@ -560,28 +457,38 @@ def main(request):
         return
 
     # 5) AI判定を行う
-    result = enrich_multiple_judge_trash(ai_data)  # 一度に判定を行う
+    result = []  # 結果を格納するリスト
+    for cleaning in ai_data:
+        image_urls = cleaning["urls"]
+        placement_id = cleaning["placementId"]
+        commonarea_name = cleaning["commonAreaName"]
+        cleaning_id = cleaning["id"]
+        common_area_id = cleaning["commonAreaId"]  # commonAreaIdを取得
+        print(f"[INFO] Processing cleaning_id: {cleaning_id} with commonAreaId: {common_area_id}")
 
-    # 判定結果を集約
-    result_list = []
-    for judge_result in result:
-        if judge_result:
-            result_list.extend(judge_result["judge_results"])  # 判定結果を追加
+        for url in image_urls:
+            # AI結果を取得
+            judge_result = judge_trash([url], placement_id, commonarea_name, cleaning_id, common_area_id)
+            if judge_result:
+                result.extend(judge_result)  # 画像ごとに判定結果を追加
 
     # 6) 結果を最終的に表示または保存する
     print("[INFO] Final judgment result:")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
+    # 7) 「〇」のみをフィルタリング
+    success_results = filter_success_results(result)
+    print("\n[INFO] Success results (〇 only):")
+    print(json.dumps(success_results, ensure_ascii=False, indent=2))
 
     # 8) 最終的に1つの辞書として返す
     final_result = {
         "result": result,
+        "success_results": success_results
     }
 
     # `final_result["result"]` をGoogle Sheetsの「判定一覧」シートに書き込む
     write_to_sheet(final_result["result"], sheet_name="判定一覧")
-    
 
 
     return final_result
-
